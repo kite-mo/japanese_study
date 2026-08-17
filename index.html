@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>가나 퀴즈</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        font-family: -apple-system, "Apple SD Gothic Neo", "Noto Sans KR",
+                     "Hiragino Sans", sans-serif;
+        background: #f4f5f7;
+        color: #24292f;
+        display: flex;
+        justify-content: center;
+        min-height: 100vh;
+        padding: 16px;
+    }
+    .app { width: 100%; max-width: 480px; }
+    h1 { font-size: 1.2rem; text-align: center; margin: 8px 0 16px; }
+
+    /* 모드 선택 */
+    .toggles { display: flex; gap: 8px; margin-bottom: 16px; }
+    .toggle-group {
+        flex: 1; display: flex; border: 1px solid #d0d7de;
+        border-radius: 8px; overflow: hidden; background: #fff;
+    }
+    .toggle-group button {
+        flex: 1; padding: 10px 4px; border: none; background: none;
+        font-size: 0.85rem; cursor: pointer; color: #57606a;
+    }
+    .toggle-group button.active {
+        background: #2563eb; color: #fff; font-weight: 600;
+    }
+
+    /* 문제 카드 */
+    .card {
+        background: #fff; border: 1px solid #d0d7de; border-radius: 12px;
+        padding: 24px 16px; text-align: center; margin-bottom: 16px;
+    }
+    .question { font-size: 4.5rem; line-height: 1.2; min-height: 5.5rem; }
+    .question.small { font-size: 2.2rem; padding-top: 1.2rem; }
+    .feedback { min-height: 1.6rem; font-size: 1rem; margin-top: 8px; }
+    .feedback.ok { color: #1a7f37; }
+    .feedback.no { color: #cf222e; }
+
+    /* 보기 버튼 */
+    .choices { display: grid; gap: 8px; }
+    .choices button {
+        padding: 14px; font-size: 1.3rem; border: 1px solid #d0d7de;
+        border-radius: 10px; background: #fff; cursor: pointer;
+    }
+    .choices button:active { background: #f0f3f6; }
+    .choices button.correct { background: #d1f0d9; border-color: #1a7f37; }
+    .choices button.wrong { background: #ffe0e0; border-color: #cf222e; }
+    .choices button:disabled { cursor: default; }
+    .choices .key {
+        display: inline-block; width: 1.4rem; color: #8c959f;
+        font-size: 0.8rem;
+    }
+
+    /* 상태 표시 */
+    .stats {
+        display: flex; justify-content: space-between; margin-top: 16px;
+        font-size: 0.85rem; color: #57606a;
+    }
+    .stats .weak { text-align: right; }
+</style>
+</head>
+<body>
+<div class="app">
+    <h1>가나 퀴즈</h1>
+
+    <div class="toggles">
+        <div class="toggle-group" id="scriptToggle">
+            <button data-v="hira" class="active">히라가나</button>
+            <button data-v="kata">가타카나</button>
+        </div>
+        <div class="toggle-group" id="dirToggle">
+            <button data-v="k2s" class="active">표기→소리</button>
+            <button data-v="s2k">소리→표기</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="question" id="question"></div>
+        <div class="feedback" id="feedback"></div>
+    </div>
+
+    <div class="choices" id="choices"></div>
+
+    <div class="stats">
+        <span id="score">0 / 0</span>
+        <span class="weak" id="weak"></span>
+    </div>
+</div>
+
+<script src="kana.js"></script>
+<script>
+"use strict";
+
+const N_CHOICES = 5;
+const STORAGE_KEY = "kana-quiz-misses-v1";
+
+// 상태
+let script = "hira";          // hira | kata
+let direction = "k2s";        // k2s: 표기→소리, s2k: 소리→표기
+let current = null;           // 현재 문제의 KANA 항목
+let answered = false;
+let nCorrect = 0;
+let nTotal = 0;
+let deck = [];                // 이번 단계 출제 순서 (비복원)
+let deckPos = 0;
+let phase = "main";           // main: 본 라운드, review: 오답 복습
+let wrongItems = [];          // 본 라운드에서 틀린 글자 (중복 없음)
+let reviewDone = 0;           // 복습에서 통과한 글자 수
+let timer = null;             // 다음 문제 자동 진행 타이머
+
+// 모드(문자×방향)별 라운드 상태 — 각 모드는 독립적으로 진행된다
+const rounds = {};            // "hira:k2s" → 저장된 라운드 상태
+
+function modeKey() {
+    return `${script}:${direction}`;
+}
+
+function saveRound() {
+    rounds[modeKey()] = { deck, deckPos, phase, wrongItems,
+                           reviewDone, nCorrect, nTotal, current };
+}
+
+function loadRound() {
+    const s = rounds[modeKey()];
+    if (s) {
+        ({ deck, deckPos, phase, wrongItems,
+           reviewDone, nCorrect, nTotal, current } = s);
+        answered = false;
+        render();
+    } else {
+        newRound();
+        next();
+    }
+}
+
+// 오답 횟수: { "hira:ka": 3, ... } — localStorage 영속
+let misses = loadMisses();
+
+function loadMisses() {
+    try {
+        return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+    } catch {
+        return {};
+    }
+}
+
+function saveMisses() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(misses));
+}
+
+function missKey(item) {
+    return `${script}:${item.romaji}`;
+}
+
+function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+// 비복원 추출: 라운드마다 46자를 섞어 각 글자를 정확히 한 번씩 출제
+function newRound() {
+    deck = shuffle(KANA.slice());
+    deckPos = 0;
+    nCorrect = 0;
+    nTotal = 0;
+    phase = "main";
+    wrongItems = [];
+    reviewDone = 0;
+}
+
+// 정답 외 4개를 무작위 선택 후 정답과 섞기
+function pickChoices(answer) {
+    const others = KANA.filter(k => k !== answer);
+    for (let i = others.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [others[i], others[j]] = [others[j], others[i]];
+    }
+    const choices = others.slice(0, N_CHOICES - 1).concat(answer);
+    for (let i = choices.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [choices[i], choices[j]] = [choices[j], choices[i]];
+    }
+    return choices;
+}
+
+function soundLabel(item) {
+    return `${item.romaji} (${item.hangul})`;
+}
+
+function choiceLabel(item) {
+    return direction === "k2s" ? soundLabel(item) : item[script];
+}
+
+function render() {
+    const qEl = document.getElementById("question");
+    if (direction === "k2s") {
+        qEl.textContent = current[script];
+        qEl.className = "question";
+    } else {
+        qEl.textContent = soundLabel(current);
+        qEl.className = "question small";
+    }
+    document.getElementById("feedback").textContent = "";
+    document.getElementById("feedback").className = "feedback";
+
+    const box = document.getElementById("choices");
+    box.innerHTML = "";
+    pickChoices(current).forEach((item, i) => {
+        const btn = document.createElement("button");
+        btn.innerHTML = `<span class="key">${i + 1}</span>${choiceLabel(item)}`;
+        btn.onclick = () => answer(item, btn);
+        box.appendChild(btn);
+    });
+    renderStats();
+}
+
+function answer(item, btn) {
+    if (answered) return;
+    answered = true;
+    if (phase === "main") nTotal++;
+
+    const fb = document.getElementById("feedback");
+    const key = missKey(current);
+    if (item === current) {
+        if (phase === "main") nCorrect++;
+        else reviewDone++;
+        btn.classList.add("correct");
+        fb.textContent = "정답!";
+        fb.className = "feedback ok";
+        // 맞히면 누적 오답 기록을 1 감소 (취약 목록에서 서서히 제외)
+        if (misses[key]) misses[key]--;
+    } else {
+        btn.classList.add("wrong");
+        fb.textContent = `오답 — ${current[script]} = ${soundLabel(current)}`;
+        fb.className = "feedback no";
+        misses[key] = (misses[key] || 0) + 1;
+        if (phase === "main") {
+            if (!wrongItems.includes(current)) wrongItems.push(current);
+        } else {
+            // 복습에서 또 틀리면 맞힐 때까지 큐 뒤로 재출제
+            deck.push(current);
+        }
+        // 정답 버튼 표시
+        [...document.querySelectorAll(".choices button")].forEach(b => {
+            if (b.textContent.slice(1) === choiceLabel(current)) {
+                b.classList.add("correct");
+            }
+        });
+    }
+    saveMisses();
+    renderStats();
+    document.querySelectorAll(".choices button")
+        .forEach(b => b.disabled = true);
+
+    // 단계 마지막 문제면 전환/종료 안내를 덧붙인다
+    const atEnd = deckPos >= deck.length;
+    let delay = item === current ? 600 : 1500;
+    if (atEnd) {
+        delay = 2200;
+        if (phase === "main") {
+            fb.textContent += wrongItems.length > 0
+                ? ` — 본 라운드 ${nCorrect}/${deck.length}, 오답 ${wrongItems.length}개 복습 시작`
+                : ` — 총 라운드 완료 ${nCorrect}/${deck.length} (오답 없음!)`;
+        } else {
+            fb.textContent += " — 복습 완료, 총 라운드 종료";
+        }
+    }
+    timer = setTimeout(next, delay);
+}
+
+// 다음 문제로 상태만 이동 (화면 갱신 없음)
+function advance() {
+    if (deckPos >= deck.length) {
+        if (phase === "main" && wrongItems.length > 0) {
+            // 본 라운드 오답을 모아 복습 단계 시작
+            phase = "review";
+            deck = shuffle(wrongItems.slice());
+            deckPos = 0;
+        } else {
+            // 오답이 없거나 복습까지 끝났으면 총 라운드 종료 → 새 라운드
+            newRound();
+        }
+    }
+    current = deck[deckPos++];
+    answered = false;
+}
+
+function next() {
+    advance();
+    render();
+}
+
+function renderStats() {
+    document.getElementById("score").textContent =
+        phase === "main"
+            ? `진행 ${nTotal} / ${deck.length} · 정답 ${nCorrect}`
+            : `복습 ${reviewDone} / ${wrongItems.length}`;
+    // 현재 문자 종류에서 오답 상위 5개 표시
+    const weak = Object.entries(misses)
+        .filter(([k, v]) => v > 0 && k.startsWith(script + ":"))
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([k, v]) => {
+            const item = KANA.find(x => x.romaji === k.split(":")[1]);
+            return `${item[script]}×${v}`;
+        })
+        .join(" ");
+    document.getElementById("weak").textContent =
+        weak ? `취약: ${weak}` : "";
+}
+
+// 모드 토글
+function bindToggle(id, onChange) {
+    const group = document.getElementById(id);
+    group.querySelectorAll("button").forEach(btn => {
+        btn.onclick = () => {
+            group.querySelectorAll("button")
+                .forEach(b => b.classList.remove("active"));
+            btn.classList.add("active");
+            // 답변 직후 대기 중이면 예약된 자동 진행을 취소하고
+            // 이 모드의 상태를 다음 문제로 넘겨둔 뒤 저장한다
+            if (answered) {
+                clearTimeout(timer);
+                advance();
+            }
+            saveRound();
+            onChange(btn.dataset.v);
+            // 대상 모드의 라운드를 복원 (처음이면 새 라운드 시작)
+            loadRound();
+        };
+    });
+}
+bindToggle("scriptToggle", v => { script = v; });
+bindToggle("dirToggle", v => { direction = v; });
+
+// 키보드 1~5 로 답변
+document.addEventListener("keydown", e => {
+    const i = parseInt(e.key, 10);
+    if (i >= 1 && i <= N_CHOICES && !answered) {
+        const btn = document.querySelectorAll(".choices button")[i - 1];
+        if (btn) btn.click();
+    }
+});
+
+next();
+</script>
+</body>
+</html>
